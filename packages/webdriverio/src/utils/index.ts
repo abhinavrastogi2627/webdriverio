@@ -639,7 +639,7 @@ async function findAriaElementViaXPathFallback(
     shadowRoots: string[]
 ) {
     const xpathLocator = toAriaXPathLocator(value)
-    const bidiOnly = isParallelContextActive() && !getScopedElementId(ctx)
+    const bidiOnly = isParallelContextActive()
     if (bidiOnly || (startNodes && startNodes.length > 0)) {
         try {
             const result = await browser.browsingContextLocateNodes({
@@ -679,7 +679,7 @@ async function findAriaElementsViaXPathFallback(
     shadowRoots: string[]
 ) {
     const xpathLocator = toAriaXPathLocator(value)
-    const bidiOnly = isParallelContextActive() && !getScopedElementId(ctx)
+    const bidiOnly = isParallelContextActive()
     if (bidiOnly || (startNodes && startNodes.length > 0)) {
         try {
             const result = await browser.browsingContextLocateNodes({
