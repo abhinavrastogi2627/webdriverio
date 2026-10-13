@@ -6,9 +6,17 @@ import { describe, it, afterEach, beforeEach, expect, vi } from 'vitest'
 import { remote } from '../../src/index.js'
 import { StrictSelectorError } from '../../src/utils/strictMode.js'
 import { itemOf } from '../../src/utils/findElementAgain.js'
+import refetchElement from '../../src/utils/refetchElement.js'
 
 vi.mock('fetch')
 vi.mock('@wdio/logger', () => import(path.join(process.cwd(), '__mocks__', '@wdio/logger')))
+/**
+ * runs the real refetch: each layer of the element middleware calls it once for a stale element
+ */
+vi.mock('../../src/utils/refetchElement.js', async (importOriginal) => {
+    const actual = await importOriginal<{ default: typeof refetchElement }>()
+    return { __esModule: true, default: vi.fn(actual.default) }
+})
 
 const SHADOW_ELEMENT_KEY = 'shadow-6066-11e4-a52e-4f735466cecf'
 
@@ -661,6 +669,40 @@ describe('finding an element again', () => {
             expect(await elem.getText()).toBe('text of elem-d')
         })
 
+        /**
+         * an `async` overwrite of `$$` gives a promise, not the element list: its index
+         * gives the same not found item as a plain `$$`
+         */
+        it('gives the same not found item for the list of an async overwrite of $$', async () => {
+            const browser = await session()
+            browser.overwriteCommand('$$', async (original$$, selector) => original$$(selector))
+
+            expect(await browser.$$('.item')[0].getText()).toBe('text of elem-a')
+            const elem = await browser.$$('.item')[3]
+            expect(elem.elementId).toBeUndefined()
+            expect(elem.index).toBe(3)
+            expect(await browser.$$('.item')[3].isExisting()).toBe(false)
+            expect(await browser.$$('.item')[3].isDisplayed()).toBe(false)
+            const { error } = await settle(browser.$$('.item')[3].click())
+            expect(error?.message).toBe('Index out of bounds! $$(.item) returned only 1 elements.')
+
+            driver.light.set('.item', ['elem-a', 'elem-b', 'elem-c', 'elem-d'])
+            expect(await elem.getText()).toBe('text of elem-d')
+        })
+
+        it('gives the same not found item for a custom command whose name ends with $$', async () => {
+            const browser = await session()
+            browser.addCommand('items$$', function (this: WebdriverIO.Browser, selector: string) {
+                return this.$$(selector)
+            })
+            const items$$ = (selector: string) => (browser as unknown as { items$$ (selector: string): WebdriverIO.ElementArray }).items$$(selector)
+
+            expect(await items$$('.item')[0].getText()).toBe('text of elem-a')
+            expect(await items$$('.item')[3].isExisting()).toBe(false)
+            const { error } = await settle(items$$('.item')[3].click())
+            expect(error?.message).toBe('Index out of bounds! $$(.item) returned only 1 elements.')
+        })
+
         it('a command uses the item of a custom$$ list once the strategy reaches its index', async () => {
             const browser = await session()
             driver.light.set('#host', ['host-a'])
@@ -670,6 +712,100 @@ describe('finding an element again', () => {
 
             expect(await elem.getText()).toBe('text of elem-d')
             expect(driver.findsIn.at(-1)).toBe('script customList with host-a')
+        })
+    })
+
+    /**
+     * The page replaced the item of a list: a command gets a stale element error, and the
+     * item is found again at its index without the wait of `$$(selector)[index]`. When the
+     * list is shorter now, the item is "not found", like `$(selector)` when the page removed
+     * its element: a check gives its answer at once, a command that needs the element waits
+     * for it and then throws the stale element error (#12576)
+     */
+    describe('a stale item of a list that no longer reaches its index', () => {
+        const goneItem = async () => {
+            const browser = await session()
+            driver.light.set('.item', ['elem-a', 'elem-b', 'elem-c'])
+            const elem = (await browser.$$('.item'))[2]
+            driver.stale.add('elem-c')
+            driver.light.set('.item', ['elem-x'])
+            return elem
+        }
+
+        it('isDisplayed is false, without a wait for the index', async () => {
+            const elem = await goneItem()
+            const finds = driver.findsIn.length
+            expect(await elem.isDisplayed()).toBe(false)
+            /**
+             * one lookup finds the item again, one more is the lookup of `isDisplayed` for a
+             * not found element. The wait for the index would look every `waitforInterval`
+             */
+            expect(driver.findsIn.slice(finds)).toEqual(['elements .item in document', 'elements .item in document'])
+        })
+
+        it('waitForDisplayed with reverse is true', async () => {
+            const elem = await goneItem()
+            expect(await elem.waitForDisplayed({ reverse: true, timeout: 50 })).toBe(true)
+        })
+
+        it('is found again once at its index, as a not found item', async () => {
+            const elem = await goneItem()
+            const finds = driver.findsIn.length
+
+            const item = await refetchElement(elem, 'isDisplayed')
+            expect(item.elementId).toBeUndefined()
+            expect(item.index).toBe(2)
+            expect(item.selector).toBe('.item')
+            expect(item.error?.message).toBe('element with selector ".item" has no match at index 2')
+            expect(driver.findsIn.slice(finds)).toEqual(['elements .item in document'])
+        })
+
+        it('getText waits for the item and throws the stale element error', async () => {
+            const elem = await goneItem()
+            const { error } = await settle(elem.getText())
+            expect(error?.name).toBe('stale element reference')
+        })
+
+        it('getText uses the item when the list reaches its index again while it waits', async () => {
+            const elem = await goneItem()
+            setTimeout(() => driver.light.set('.item', ['elem-x', 'elem-y', 'elem-z']), 30)
+            expect(await elem.getText()).toBe('text of elem-z')
+        })
+
+        /**
+         * Each layer of the element middleware finds a stale element again once. An item
+         * has as many layers as `$()`, whatever its index: with one more layer for each
+         * item, a command on a gone item `[n]` threw after `(n + 1) * 2 * waitforTimeout`
+         */
+        it('is found again as often as $() when it is stale, whatever its index', async () => {
+            const refetches = async (find: (browser: WebdriverIO.Browser) => Promise<WebdriverIO.Element>, id: string) => {
+                const browser = await session()
+                driver.light.set('.item', ['elem-a', 'elem-b', 'elem-c'])
+                driver.light.set('#ref', ['elem-r'])
+                const elem = await find(browser)
+                driver.stale.add(id)
+                driver.light.set('.item', [])
+                driver.light.set('#ref', [])
+                vi.mocked(refetchElement).mockClear()
+
+                const { error } = await settle(elem.getText())
+                expect(error?.name).toBe('stale element reference')
+                return vi.mocked(refetchElement).mock.calls.length
+            }
+
+            const reference = await refetches((browser) => browser.$('#ref').getElement(), 'elem-r')
+            expect(reference).toBeGreaterThan(0)
+            expect([
+                await refetches(async (browser) => (await browser.$$('.item'))[0], 'elem-a'),
+                await refetches(async (browser) => (await browser.$$('.item'))[2], 'elem-c')
+            ]).toEqual([reference, reference])
+        })
+
+        it('a stale item whose index the list still reaches is found again', async () => {
+            const elem = await goneItem()
+            driver.light.set('.item', ['elem-x', 'elem-y', 'elem-z'])
+            expect(await elem.isDisplayed()).toBe(true)
+            expect(await elem.getText()).toBe('text of elem-z')
         })
     })
 
@@ -896,6 +1032,41 @@ describe('finding an element again in strict mode', () => {
         expect(await elem.isExisting()).toBe(true)
         expect(elem.elementId).toBeUndefined()
         await expect(elem.getText()).rejects.toThrow(StrictSelectorError)
+    })
+})
+
+/**
+ * the selector of a `custom$` / `custom$$` element is the strategy reference, an object:
+ * the messages show the strategy name, not `[object Object]`
+ */
+describe('the selector of a custom strategy element in messages', () => {
+    it('names the strategy in the timeout message of a wait command', async () => {
+        const browser = await session()
+        const { error } = await settle(browser.custom$('customItem').waitForExist({ timeout: 50 }))
+        expect(error?.message).toBe('element ("custom$(customItem)") still not existing after 50ms')
+
+        driver.scripts.set('customList', ['elem-a'])
+        const { error: reverse } = await settle(browser.custom$$('customList')[0].waitForDisplayed({ reverse: true, timeout: 50 }))
+        expect(reverse?.message).toBe('element ("custom$$(customList)") still displayed after 50ms')
+    })
+
+    it('names the strategy when a command is called on an element that was not found', async () => {
+        const browser = await session()
+        const { error } = await settle(browser.custom$('customItem').click())
+        expect(error?.message).toBe('Can\'t call click on element with selector "custom$(customItem)" because element wasn\'t found')
+    })
+
+    it('names the strategy when a missing element is passed to execute', async () => {
+        const browser = await session()
+        const elem = await browser.custom$('customItem')
+        const { error } = await settle(browser.execute((el) => el, elem as unknown as HTMLElement))
+        expect(error?.message).toBe('The element with selector "custom$(customItem)" you are trying to pass into the execute method wasn\'t found')
+    })
+
+    it('keeps a string selector as it is', async () => {
+        const browser = await session()
+        const { error } = await settle(browser.$('.missing').waitForExist({ timeout: 50 }))
+        expect(error?.message).toBe('element (".missing") still not existing after 50ms')
     })
 })
 

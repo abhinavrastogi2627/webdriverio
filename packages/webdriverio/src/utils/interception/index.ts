@@ -10,6 +10,7 @@ import { parseOverwrite, getPatternParam } from './utils.js'
 import { SESSION_MOCKS } from '../../commands/browser/mock.js'
 import type { MockFilterOptions, RequestWithOptions, RespondWithOptions, Response } from './types.js'
 import type { WaitForOptions } from '../../types.js'
+import { logBackgroundError } from '../sessionEnded.js'
 
 const log = logger('WebDriverInterception')
 
@@ -388,7 +389,7 @@ export default class WebDriverInterception {
             if (request.intercepts?.includes(this.#mockId)) {
                 return this.#release(request, false, () => this.#browser.networkContinueRequest({
                     request: request.request.request
-                }))
+                }).catch(this.#handleNetworkProvideResponseError))
             }
             return
         }
@@ -403,7 +404,7 @@ export default class WebDriverInterception {
             if (!this.#matchesFilterOptions(request, { includePostData: false })) {
                 return this.#release(request, false, () => this.#browser.networkContinueRequest({
                     request: request.request.request
-                }))
+                }).catch(this.#handleNetworkProvideResponseError))
             }
 
             const decision = this.#handleBeforeRequestSentWithPostData(request)
@@ -455,7 +456,7 @@ export default class WebDriverInterception {
         if (!matches) {
             return this.#release(request, false, () => this.#browser.networkContinueRequest({
                 request: request.request.request
-            }))
+            }).catch(this.#handleNetworkProvideResponseError))
         }
 
         const requestId = request.request.request
@@ -475,7 +476,7 @@ export default class WebDriverInterception {
                 this.#emit('fail', requestId)
                 return this.#release(request, true, () => this.#withBlockedRequestTracking(
                     requestId,
-                    this.#browser.networkFailRequest({ request: requestId })
+                    this.#browser.networkFailRequest({ request: requestId }).catch(this.#handleNetworkProvideResponseError)
                 ))
             }
         }
@@ -546,7 +547,7 @@ export default class WebDriverInterception {
                 this.#browser.networkContinueRequest({
                     request: requestId,
                     ...(overwrite ? parseOverwrite(overwrite, request) : {})
-                })
+                }).catch(this.#handleNetworkProvideResponseError)
             ))
         }
 
@@ -555,7 +556,7 @@ export default class WebDriverInterception {
             requestId,
             this.#browser.networkContinueRequest({
                 request: requestId
-            })
+            }).catch(this.#handleNetworkProvideResponseError)
         ))
     }
 
@@ -803,12 +804,16 @@ export default class WebDriverInterception {
         return this.#browser.networkProvideResponse({ request: requestId }).catch(this.#handleNetworkProvideResponseError)
     }
 
-    #handleNetworkProvideResponseError(err: Error) {
+    /**
+     * The error of a network command that answers a paused request. It runs in a network
+     * event listener: no caller waits for it, so it is logged, not thrown (a thrown error
+     * would be an unhandled rejection). A request that is gone needs no answer.
+     */
+    #handleNetworkProvideResponseError = (err: Error) => {
         if (err.message.endsWith('no such request')) {
             return
         }
-
-        throw err
+        logBackgroundError(log, 'Failed to answer a paused request', err, this.#browser)
     }
 
     /**

@@ -4,6 +4,7 @@ import logger from '@wdio/logger'
 import { SessionManager } from './session.js'
 import { getMobileContext, getNativeContext } from '../utils/mobile.js'
 import { environment } from '../environment.js'
+import { logBackgroundError } from '../utils/sessionEnded.js'
 
 const log = logger('webdriverio:context')
 const COMMANDS_REQUIRING_RESET = ['deleteSession', 'refresh', 'switchToParentFrame']
@@ -198,9 +199,12 @@ export class ContextManager extends SessionManager {
              * Listen to the 'browsingContext.navigationStarted' event to handle context changes
              * through navigation within e.g. frames.
              */
+            /**
+             * not awaited: an error has no caller, e.g. when the session ends at once
+             */
             this.#browser.sessionSubscribe({
                 events: ['browsingContext.navigationStarted', 'browsingContext.contextDestroyed']
-            })
+            }).catch((err) => logBackgroundError(log, 'Failed to subscribe to the navigation events of the context manager', err, this.#browser))
             this.#browser.on('browsingContext.navigationStarted', this.#navigationStartedListener)
             this.#browser.on('browsingContext.contextDestroyed', this.#destroyedListener)
         }
@@ -241,19 +245,27 @@ export class ContextManager extends SessionManager {
          * current tree and see if our context is still there, if not, we need to reset
          * the context to the first context in the tree.
          */
-        const { contexts } = await this.#browser.browsingContextGetTree({})
-        /**
-         * check if the context is still in the tree, if not, switch to...
-         */
-        const hasContext = this.findContext(this.#currentContext, contexts, 'byContextId')
-        /**
-         * ...the context we are navigating to
-         */
-        const newContext = contexts.find((context) => context.context === nav.context)
-        if (!hasContext && newContext) {
-            this.setCurrentContext(newContext.context)
-            await this.#browser.switchToWindow(this.#currentContext)
-            return
+        try {
+            const { contexts } = await this.#browser.browsingContextGetTree({})
+            /**
+             * check if the context is still in the tree, if not, switch to...
+             */
+            const hasContext = this.findContext(this.#currentContext, contexts, 'byContextId')
+            /**
+             * ...the context we are navigating to
+             */
+            const newContext = contexts.find((context) => context.context === nav.context)
+            if (!hasContext && newContext) {
+                this.setCurrentContext(newContext.context)
+                await this.#browser.switchToWindow(this.#currentContext)
+                return
+            }
+        } catch (err) {
+            /**
+             * an event handler has no caller to give the error to, e.g. when the
+             * session ends while the tree is requested
+             */
+            logBackgroundError(log, `Failed to update the context after a navigation in "${nav.context}"`, err, this.#browser)
         }
     }
 
@@ -325,7 +337,7 @@ export class ContextManager extends SessionManager {
                 this.#currentContext = undefined
                 this.#currentWindowHandle = undefined
             }
-            log.warn(`Failed to switch context after "${destroyed.context}" was destroyed: ${(err as Error).message}`)
+            logBackgroundError(log, `Failed to switch context after "${destroyed.context}" was destroyed`, err, this.#browser)
         }
     }
 
@@ -357,7 +369,11 @@ export class ContextManager extends SessionManager {
                 throw new Error('All window handles were removed, causing WebdriverIO to close the session.')
             }
             this.#currentContext = windowHandles[0]
+            /**
+             * an event listener: the error has no caller, e.g. when the session ends at once
+             */
             return this.#browser.switchToWindow(this.#currentContext)
+                .catch((err) => logBackgroundError(log, `Failed to switch to window "${windowHandles[0]}" after closeWindow`, err, this.#browser))
         }
 
         /**
@@ -423,6 +439,8 @@ export class ContextManager extends SessionManager {
                     return
                 }
                 this.setCurrentContext(parentContext.context)
+            }).catch((err: Error) => {
+                logBackgroundError(log, 'Failed to update the context after switchToParentFrame', err, this.#browser)
             })
         }
 
